@@ -18,9 +18,10 @@
  ** along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-use serde::{Deserialize, Serialize};
 use clap::{App, Arg, ArgMatches};
+use log::{info, warn};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::Map;
 
 pub fn get_current_timestamp() -> u64 {
@@ -31,7 +32,6 @@ pub fn get_current_timestamp() -> u64 {
     since_the_epoch.as_secs()
 }
 
-
 #[derive(Deserialize, Serialize)]
 struct TokenField {
     token: String,
@@ -39,9 +39,7 @@ struct TokenField {
 
 impl TokenField {
     fn new(token: String) -> Self {
-        Self {
-            token
-        }
+        Self { token }
     }
 }
 
@@ -60,7 +58,6 @@ impl From<&Server> for LuciLoginField {
     }
 }
 
-
 #[derive(Deserialize, Serialize)]
 struct Server {
     host: String,
@@ -70,9 +67,7 @@ struct Server {
 
 impl Server {
     fn try_from_matches(matches: &ArgMatches) -> Option<Self> {
-        if matches.value_of("password").is_none() {
-            return None
-        }
+        matches.value_of("password")?;
         Some(Self {
             host: matches.value_of("host").unwrap().to_string(),
             user: matches.value_of("user").unwrap().to_string(),
@@ -87,7 +82,7 @@ impl Server {
 
 #[derive(Deserialize, Serialize)]
 struct Config {
-    server: Server
+    server: Server,
 }
 
 impl Config {
@@ -106,51 +101,82 @@ async fn async_main(matches: &ArgMatches) -> anyhow::Result<()> {
     };
     let token_exp = Regex::new(r"token: '(?P<token>[\da-f]{32})'")?;
     let client = reqwest::ClientBuilder::new().cookie_store(true).build()?;
-    client.post(format!("{}/cgi-bin/luci", server.get_host()))
+    client
+        .post(format!("{}/cgi-bin/luci", server.get_host()))
         .form(&LuciLoginField::from(&server))
         .send()
         .await?;
-    let response = client.get(format!("{}/cgi-bin/luci/?status=1&_={}", server.get_host(), get_current_timestamp()))
+    let response = client
+        .get(format!(
+            "{}/cgi-bin/luci/?status=1&_={}",
+            server.get_host(),
+            get_current_timestamp()
+        ))
         .send()
         .await?;
     let response: Map<String, serde_json::Value> = response.json().await?;
-    if let Some(serde_json::Value::String(cpu)) = response.get("cpuusage"){
-        let (usage, _) = cpu.split_once("\\").unwrap();
-        if usage.parse::<i32>().unwrap() > 20 {
+    if let Some(serde_json::Value::String(cpu)) = response.get("cpuusage") {
+        let (usage, _) = cpu.split_once("\n").unwrap();
+        let cpu_usage = usage.parse::<i32>().unwrap();
+        if cpu_usage > 20 {
+            info!(
+                "Current cpu usage is {}, checking is always in this value",
+                cpu_usage
+            );
             if let Some(serde_json::Value::Array(load_avg)) = response.get("loadavg") {
-                if load_avg.iter().map(|x| {
-                    if let serde_json::Value::Number(n) = x {
-                        n.as_i64().unwrap() > 65000
-                    } else {
-                        false
-                    }
-                }).all(|x| x) {
-                    let response = client.get(format!("{}/cgi-bin/luci/admin/system/reboot", server.get_host()))
+                if load_avg
+                    .iter()
+                    .map(|x| {
+                        if let serde_json::Value::Number(n) = x {
+                            let value = n.as_i64().unwrap();
+                            if value > 65000 {
+                                info!("Current load average value is {}", value);
+                            }
+                            value > 65000
+                        } else {
+                            false
+                        }
+                    })
+                    .all(|x| x)
+                {
+                    warn!("Should call reboot now, performance OpenWRT reboot");
+                    let response = client
+                        .get(format!(
+                            "{}/cgi-bin/luci/admin/system/reboot",
+                            server.get_host()
+                        ))
                         .send()
                         .await?;
                     let response = response.text().await?;
                     let matches = token_exp.captures(response.as_str()).unwrap();
                     let token = &matches["token"];
-                    client.post(format!("{}/cgi-bin/luci/admin/system/reboot/call", server.get_host()))
+                    client
+                        .post(format!(
+                            "{}/cgi-bin/luci/admin/system/reboot/call",
+                            server.get_host()
+                        ))
                         .form(&TokenField::new(token.to_string()))
                         .send()
                         .await?;
                 }
             }
+        } else {
+            info!(
+                "Current cpu usage is {}, there is nothing to do.",
+                cpu_usage
+            )
         }
     }
     Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
+    env_logger::Builder::from_default_env().init();
     let matches = App::new("Auto reboot openwrt service")
         .version(env!("CARGO_PKG_VERSION"))
-        .arg(Arg::new("host")
-            .about("Specify remote host"))
-        .arg(Arg::new("user")
-            .about("Specify host username"))
-        .arg(Arg::new("password")
-            .about("Specify host password"))
+        .arg(Arg::new("host").about("Specify remote host"))
+        .arg(Arg::new("user").about("Specify host username"))
+        .arg(Arg::new("password").about("Specify host password"))
         .get_matches();
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
